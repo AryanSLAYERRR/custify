@@ -90,7 +90,7 @@ function loadFromSpotifyIdFile() {
             });
 
             if (audioFile) {
-                const relativePath = path.join(cleanArtist, cleanAlbum, audioFile);
+                const relativePath = path.join(cleanArtist, cleanAlbum, audioFile).replace(/\\/g, '/');
                 trackMappings[trackId] = {
                     file: relativePath,
                     title: cleanTrack,
