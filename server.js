@@ -21,98 +21,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─── Track Mappings ──────────────────────────────────────────────────────────
-// Maps Spotify track IDs to local audio file paths (relative to music/ dir)
-// Format: { "spotifyTrackId": "Artist/Album/filename.flac" }
-
-const MUSIC_DIR = path.resolve(__dirname, 'music');
-const MAPPINGS_FILE = path.resolve(__dirname, 'track_mappings.json');
-
-let trackMappings = {};
-
-function loadMappings() {
-    try {
-        if (fs.existsSync(MAPPINGS_FILE)) {
-            trackMappings = JSON.parse(fs.readFileSync(MAPPINGS_FILE, 'utf-8'));
-            console.log(`[Custify] Loaded ${Object.keys(trackMappings).length} track mapping(s)`);
-        } else {
-            console.log('[Custify] No track_mappings.json found, creating default...');
-            trackMappings = {};
-            saveMappings();
-        }
-    } catch (err) {
-        console.error('[Custify] Error loading mappings:', err.message);
-    }
-}
-
-function saveMappings() {
-    fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(trackMappings, null, 2));
-}
-
-// ─── Auto-discover mappings from spotify-id.txt ──────────────────────────────
-function loadFromSpotifyIdFile() {
-    const idFile = path.resolve(__dirname, '..', 'spotify-id.txt');
-    if (!fs.existsSync(idFile)) return;
-
-    const lines = fs.readFileSync(idFile, 'utf-8').trim().split('\n');
-    let newMappings = 0;
-
-    for (const line of lines) {
-        // Format: "70LcF31zb1H0PyJoS1Sx1r -  Creep(E), Pablo Honey, Radiohead"
-        const match = line.match(/^(\S+)\s*-\s*(.+),\s*(.+),\s*(.+)$/);
-        if (!match) continue;
-
-        const [, trackId, trackName, album, artist] = match;
-        const cleanTrack = trackName.trim();
-        const cleanAlbum = album.trim();
-        const cleanArtist = artist.trim();
-
-        // Skip if already mapped
-        if (trackMappings[trackId]) continue;
-
-        // Try to find the audio file in music/ directory
-        const artistDir = path.join(MUSIC_DIR, cleanArtist);
-        const albumDir = path.join(artistDir, cleanAlbum);
-
-        if (fs.existsSync(albumDir)) {
-            const files = fs.readdirSync(albumDir);
-            // Find a file that matches the track name (fuzzy)
-            const audioFile = files.find(f => {
-                const ext = path.extname(f).toLowerCase();
-                if (!['.flac', '.mp3', '.wav', '.aac', '.ogg', '.m4a'].includes(ext)) return false;
-                const baseName = f.toLowerCase();
-                // Match against track name (strip explicit markers, numbers, etc.)
-                const searchTerms = cleanTrack
-                    .replace(/\(E\)/gi, '')
-                    .replace(/\[Explicit\]/gi, '')
-                    .trim()
-                    .toLowerCase()
-                    .split(/\s+/);
-                return searchTerms.every(term => baseName.includes(term));
-            });
-
-            if (audioFile) {
-                const relativePath = path.join(cleanArtist, cleanAlbum, audioFile).replace(/\\/g, '/');
-                trackMappings[trackId] = {
-                    file: relativePath,
-                    title: cleanTrack,
-                    album: cleanAlbum,
-                    artist: cleanArtist
-                };
-                newMappings++;
-                console.log(`[Custify] Auto-mapped: ${trackId} → ${relativePath}`);
-            } else {
-                console.warn(`[Custify] No audio file found for "${cleanTrack}" in ${albumDir}`);
-            }
-        } else {
-            console.warn(`[Custify] Album directory not found: ${albumDir}`);
-        }
-    }
-
-    if (newMappings > 0) {
-        saveMappings();
-        console.log(`[Custify] Auto-discovered ${newMappings} new mapping(s)`);
-    }
-}
+// JSON mappings are deprecated in favor of SQLite (spotify_mappings table)
+// to support hundreds of thousands of tracks.
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
@@ -139,29 +49,29 @@ app.get('/health', (req, res) => {
 
 // List all track mappings
 app.get('/catalog', (req, res) => {
-    const catalog = Object.entries(trackMappings).map(([id, info]) => ({
-        spotifyId: id,
-        title: info.title || path.basename(info.file || info, path.extname(info.file || info)),
-        album: info.album || 'Unknown',
-        artist: info.artist || 'Unknown',
-        file: info.file || info
-    }));
-    res.json({ tracks: catalog, total: catalog.length });
+    try {
+        const dbPath = path.resolve(__dirname, 'keys.db');
+        if (!fs.existsSync(dbPath)) {
+            return res.status(500).json({ error: 'keys.db not found' });
+        }
+        
+        const db = new Database(dbPath, { readonly: true });
+        const catalog = db.prepare(`
+            SELECT sm.spotify_id as spotifyId, ac.title, ac.album, ac.artist, sm.asin
+            FROM spotify_mappings sm
+            LEFT JOIN asin_cache ac ON sm.asin = ac.asin
+        `).all();
+        db.close();
+        
+        res.json({ tracks: catalog, total: catalog.length });
+    } catch (e) {
+        res.status(500).json({ error: 'Database error', details: e.message });
+    }
 });
 
 // Get track info (Amazon CDN URL + Decryption Key)
 app.get('/track/:spotifyId/info', (req, res) => {
     const { spotifyId } = req.params;
-    const mapping = trackMappings[spotifyId];
-
-    if (!mapping) {
-        return res.status(404).json({ error: 'Track not mapped', spotifyId });
-    }
-
-    const asin = mapping.asin;
-    if (!asin) {
-        return res.status(400).json({ error: 'Mapping does not have an ASIN', spotifyId });
-    }
 
     try {
         const dbPath = path.resolve(__dirname, 'keys.db');
@@ -170,7 +80,20 @@ app.get('/track/:spotifyId/info', (req, res) => {
         }
         
         const db = new Database(dbPath, { readonly: true });
+        
+        // 1. Lookup ASIN from Spotify ID
+        const mapRow = db.prepare('SELECT asin FROM spotify_mappings WHERE spotify_id = ?').get(spotifyId);
+        if (!mapRow) {
+            db.close();
+            return res.status(404).json({ error: 'Track not mapped to ASIN', spotifyId });
+        }
+        const asin = mapRow.asin;
+
+        // 2. Fetch Keys & URL
         const row = db.prepare('SELECT url, keys_json FROM keys WHERE asin = ?').get(asin);
+        
+        // 3. Fetch metadata
+        const metaRow = db.prepare('SELECT title, artist, album FROM asin_cache WHERE asin = ?').get(asin);
         db.close();
 
         if (!row) {
@@ -187,9 +110,9 @@ app.get('/track/:spotifyId/info', (req, res) => {
         res.json({
             spotifyId,
             asin,
-            title: mapping.title || '',
-            artist: mapping.artist || '',
-            album: mapping.album || '',
+            title: metaRow ? metaRow.title : '',
+            artist: metaRow ? metaRow.artist : '',
+            album: metaRow ? metaRow.album : '',
             url: row.url,
             keyHex: keyHex,
             format: 'flac-raw' // Expected by the Android native decryptor
@@ -203,25 +126,24 @@ app.get('/track/:spotifyId/info', (req, res) => {
 
 // Add a new track mapping via POST
 app.post('/track', (req, res) => {
-    const { spotifyId, file, title, album, artist } = req.body;
-    if (!spotifyId || !file) {
-        return res.status(400).json({ error: 'spotifyId and file are required' });
+    const { spotifyId, asin } = req.body;
+    if (!spotifyId || !asin) {
+        return res.status(400).json({ error: 'spotifyId and asin are required' });
     }
 
-    const filePath = path.join(MUSIC_DIR, file);
-    if (!fs.existsSync(filePath)) {
-        return res.status(400).json({ error: `File not found: ${file}` });
+    try {
+        const dbPath = path.resolve(__dirname, 'keys.db');
+        const db = new Database(dbPath);
+        db.prepare('CREATE TABLE IF NOT EXISTS spotify_mappings (spotify_id TEXT PRIMARY KEY, asin TEXT NOT NULL)').run();
+        db.prepare('INSERT OR REPLACE INTO spotify_mappings (spotify_id, asin) VALUES (?, ?)').run(spotifyId, asin);
+        db.close();
+        res.json({ message: 'Track mapped successfully', spotifyId, asin });
+    } catch (e) {
+        res.status(500).json({ error: 'Database error', details: e.message });
     }
-
-    trackMappings[spotifyId] = { file, title: title || '', album: album || '', artist: artist || '' };
-    saveMappings();
-
-    res.json({ message: 'Track mapped successfully', spotifyId, file });
 });
 
 // ─── Start Server ────────────────────────────────────────────────────────────
-loadMappings();
-loadFromSpotifyIdFile();
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log('');
@@ -229,8 +151,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('║              🎵  CUSTIFY MOCK SERVER  🎵               ║');
     console.log('╠══════════════════════════════════════════════════════════╣');
     console.log(`║  Server running on: http://0.0.0.0:${PORT}               ║`);
-    console.log(`║  Tracks loaded:     ${String(Object.keys(trackMappings).length).padEnd(35)}║`);
-    console.log(`║  Music directory:   ${MUSIC_DIR.substring(0, 35).padEnd(35)}║`);
     console.log('╠══════════════════════════════════════════════════════════╣');
     console.log('║  Endpoints:                                             ║');
     console.log('║    GET  /health              → Server health check      ║');
@@ -239,11 +159,5 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('║    POST /track               → Add new mapping          ║');
     console.log('║    POST /track               → Add new mapping          ║');
     console.log('╚══════════════════════════════════════════════════════════╝');
-    console.log('');
-    
-    // Print loaded mappings
-    for (const [id, info] of Object.entries(trackMappings)) {
-        console.log(`  📀 ${id} → ${info.artist} - ${info.title}`);
-    }
     console.log('');
 });
