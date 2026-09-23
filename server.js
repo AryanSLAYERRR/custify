@@ -15,6 +15,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const Database = require('better-sqlite3');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -148,101 +149,55 @@ app.get('/catalog', (req, res) => {
     res.json({ tracks: catalog, total: catalog.length });
 });
 
-// Get track info (metadata without streaming)
+// Get track info (Amazon CDN URL + Decryption Key)
 app.get('/track/:spotifyId/info', (req, res) => {
     const { spotifyId } = req.params;
     const mapping = trackMappings[spotifyId];
 
     if (!mapping) {
-        return res.status(404).json({ error: 'Track not found', spotifyId });
+        return res.status(404).json({ error: 'Track not mapped', spotifyId });
     }
 
-    const filePath = path.join(MUSIC_DIR, mapping.file || mapping);
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Audio file missing', spotifyId, expectedPath: filePath });
+    const asin = mapping.asin;
+    if (!asin) {
+        return res.status(400).json({ error: 'Mapping does not have an ASIN', spotifyId });
     }
 
-    const stat = fs.statSync(filePath);
-    const ext = path.extname(filePath).toLowerCase();
+    try {
+        const dbPath = path.resolve(__dirname, '..', 'keys.db');
+        if (!fs.existsSync(dbPath)) {
+            return res.status(500).json({ error: 'keys.db not found' });
+        }
+        
+        const db = new Database(dbPath, { readonly: true });
+        const row = db.prepare('SELECT url, keys_json FROM keys WHERE asin = ?').get(asin);
+        db.close();
 
-    const mimeTypes = {
-        '.flac': 'audio/flac',
-        '.mp3': 'audio/mpeg',
-        '.wav': 'audio/wav',
-        '.aac': 'audio/aac',
-        '.ogg': 'audio/ogg',
-        '.m4a': 'audio/mp4'
-    };
+        if (!row) {
+            return res.status(404).json({ error: 'ASIN not found in keys.db', asin });
+        }
 
-    res.json({
-        spotifyId,
-        title: mapping.title || '',
-        album: mapping.album || '',
-        artist: mapping.artist || '',
-        format: ext.replace('.', ''),
-        mimeType: mimeTypes[ext] || 'application/octet-stream',
-        fileSize: stat.size,
-        file: mapping.file || mapping
-    });
-});
+        const keysArray = JSON.parse(row.keys_json);
+        const keyHex = keysArray.length > 0 ? keysArray[0].k : null;
 
-// Stream audio file for a track
-app.get('/track/:spotifyId', (req, res) => {
-    const { spotifyId } = req.params;
-    const mapping = trackMappings[spotifyId];
+        if (!keyHex) {
+            return res.status(500).json({ error: 'No decryption key found for ASIN', asin });
+        }
 
-    if (!mapping) {
-        console.warn(`[Custify] ❌ Track not found: ${spotifyId}`);
-        return res.status(404).json({ error: 'Track not found', spotifyId });
-    }
-
-    const filePath = path.join(MUSIC_DIR, mapping.file || mapping);
-    if (!fs.existsSync(filePath)) {
-        console.warn(`[Custify] ❌ File missing: ${filePath}`);
-        return res.status(404).json({ error: 'Audio file missing', spotifyId });
-    }
-
-    const stat = fs.statSync(filePath);
-    const ext = path.extname(filePath).toLowerCase();
-
-    const mimeTypes = {
-        '.flac': 'audio/flac',
-        '.mp3': 'audio/mpeg',
-        '.wav': 'audio/wav',
-        '.aac': 'audio/aac',
-        '.ogg': 'audio/ogg',
-        '.m4a': 'audio/mp4'
-    };
-
-    // Support range requests (for seeking)
-    const range = req.headers.range;
-    if (range) {
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-        const chunkSize = end - start + 1;
-
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': mimeTypes[ext] || 'application/octet-stream'
+        res.json({
+            spotifyId,
+            asin,
+            title: mapping.title || '',
+            artist: mapping.artist || '',
+            album: mapping.album || '',
+            url: row.url,
+            keyHex: keyHex,
+            format: 'flac-raw' // Expected by the Android native decryptor
         });
-
-        fs.createReadStream(filePath, { start, end }).pipe(res);
-        console.log(`[Custify] ✅ Streaming (range ${start}-${end}): ${mapping.title || spotifyId}`);
-    } else {
-        res.writeHead(200, {
-            'Content-Length': stat.size,
-            'Content-Type': mimeTypes[ext] || 'application/octet-stream',
-            'Accept-Ranges': 'bytes',
-            'X-Custify-Track': spotifyId,
-            'X-Custify-Title': encodeURIComponent(mapping.title || ''),
-            'X-Custify-Artist': encodeURIComponent(mapping.artist || '')
-        });
-
-        fs.createReadStream(filePath).pipe(res);
-        console.log(`[Custify] ✅ Streaming full: ${mapping.title || spotifyId} (${(stat.size / 1024 / 1024).toFixed(1)}MB)`);
+        console.log(`[Custify] 🔑 Served key for ${spotifyId} -> ${asin}`);
+    } catch (e) {
+        console.error('[Custify] Database error:', e.message);
+        res.status(500).json({ error: 'Database error', details: e.message });
     }
 });
 
@@ -280,8 +235,8 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('║  Endpoints:                                             ║');
     console.log('║    GET  /health              → Server health check      ║');
     console.log('║    GET  /catalog             → List all track mappings  ║');
-    console.log('║    GET  /track/:id           → Stream audio file        ║');
-    console.log('║    GET  /track/:id/info      → Track metadata           ║');
+    console.log('║    GET  /track/:id/info      → Returns Amazon URL + Key ║');
+    console.log('║    POST /track               → Add new mapping          ║');
     console.log('║    POST /track               → Add new mapping          ║');
     console.log('╚══════════════════════════════════════════════════════════╝');
     console.log('');
