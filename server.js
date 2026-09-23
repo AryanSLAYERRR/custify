@@ -164,7 +164,7 @@ app.get('/track/:spotifyId/info', (req, res) => {
     }
 
     try {
-        const dbPath = path.resolve(__dirname, '..', 'keys.db');
+        const dbPath = path.resolve(__dirname, 'keys.db');
         if (!fs.existsSync(dbPath)) {
             return res.status(500).json({ error: 'keys.db not found' });
         }
